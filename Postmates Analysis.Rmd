@@ -1,0 +1,396 @@
+---
+title: "Jumpman Analysis"
+date: "3/4/2018"
+output: html_document
+---
+**Jumpman23 Analysis**
+
+Read in necessary packages and data file
+```{r results='hide', message=FALSE, warning=FALSE}
+#load in data and add libraries
+library(readr)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library(lubridate)
+library(geosphere)
+library(ggplot2)
+library(RColorBrewer)
+library(ggthemes)
+library(gridExtra)
+library(stringr)
+pm <- read_csv("analyze_me.csv")
+```
+
+Understand dimensions and data types. We will be working with a 5983 X 18 data frame. Summary/overview of data looks like we will be dealing with delivery data for Jumpman23. List of variables that catch my eye are lat/lon variables, as well as POSIXct variables. Further derivation will probably have to be computed from these variables. We might also have to work with strings when aggregating by restaurant. I recommend that Jumpman23 assign unique IDs for pickup_place, as well as another ID to distinguish by location.
+```{r message=FALSE, warning=FALSE}
+#understand the data on a high level
+dim(pm)
+#str(pm)
+```
+
+Extract time attributes in minutes, hours and seconds. We want to calculate the amount of time that it took for a delivery to complete, an order to be placed, the amount of time it took for pickup, and  the amount of time it took for food to be delivered after the pickup. 
+```{r}
+#create variables for: total time, total pickup time, total order time, total delivery time 
+pm <- as.data.frame(pm)
+pm <-
+  pm %>%
+  mutate(
+    pick_up_wait_secs =  difftime(when_the_Jumpman_left_pickup, when_the_Jumpman_arrived_at_pickup, units = "secs"),
+    total_time_secs =  difftime(when_the_Jumpman_arrived_at_dropoff, when_the_delivery_started, units = "secs"),
+    order_time_secs = period_to_seconds(hms(pm$how_long_it_took_to_order)),
+    pick_up_wait_mins =  difftime(when_the_Jumpman_left_pickup, when_the_Jumpman_arrived_at_pickup, units = "mins"),
+    total_time_mins =  difftime(when_the_Jumpman_arrived_at_dropoff, when_the_delivery_started, units = "mins"),
+    total_time_hours =  difftime(when_the_Jumpman_arrived_at_dropoff, when_the_delivery_started, units = "hours"),
+    order_time_mins = period_to_seconds(hms(pm$how_long_it_took_to_order))/60,
+    delivery_time_secs = difftime( when_the_Jumpman_arrived_at_dropoff, when_the_Jumpman_left_pickup, units = "secs"),
+    delivery_time_mins = difftime(when_the_Jumpman_arrived_at_dropoff, when_the_Jumpman_left_pickup, units = "mins")
+  )
+```
+
+Extract the distance traveled from pickup to drop-off via the Haversine formula of provided lon and lat coordinates. Convert into miles and meters. Then, compute miles per hour traveled by dividing distance traveled by delivery time in miles.
+
+```{r}
+#create variables for distance traveled from pick up to dropoff
+pm <- 
+  pm %>%
+  mutate(
+   miles_traveled = (distHaversine(cbind(pm$pickup_lon,pm$pickup_lat), cbind(pm$dropoff_lon, pm$dropoff_lat))/1609.34),
+   meters_traveled = (distHaversine(cbind(pm$pickup_lon,pm$pickup_lat), cbind(pm$dropoff_lon, pm$dropoff_lat)))
+  )
+
+#create variables for speed traveled, mph, metersph
+pm <-
+  pm %>% 
+  mutate(
+    mph = miles_traveled/(as.numeric(delivery_time_mins/60)),
+    mpminue = miles_traveled/(as.numeric(delivery_time_mins)),
+    metersph = meters_traveled/(as.numeric(delivery_time_mins/60)),
+    meterpminue = meters_traveled/as.numeric(delivery_time_mins)
+  )
+```
+
+
+In this section, we will address issues with data integrity. This will include:
+
+1. Removing occurrences when the total wait time during pickup exceeds total delivery time. (3 occurrences)
+
+2. Removing occurrences when MPH traveled via bike exceeds 35 MPH (unlikely), and when MPH traveled via walking > 20MPH. As an example, we saw an occurrence of a bicyclist traveling 112 miles per hour. 
+
+3. Removing occurrences where the total delivery time exceeds 4 hours. There was one occurrence where a worker waited for a long time during pickup (>3 hrs) which resulted in total delivery time exceeding 4 hours. I believe this was a data issue. 
+
+4. Handling mislabeled data and deprecated/archived locations (for pickup_place). We reduced the amount of distinct pickup-places from 896 to 879. 
+  a. Remove all non-alphanumeric characters
+  b. Upper case all locations
+  c. Remove deprecated/closed/archived locations.
+
+5. Standardizing duplicate delivery ids. Each row in this table should contain a unique delivery ID. We reduced total rows from 5840 to 5102 observations after removing duplicate IDs. Method to clean this includes:
+  a. Creating new variables to aggregate item_name, item_category_name, as well as sum of item qantity. 
+  b. Removing occurrences when we observe a duplicate entry. 
+
+6. Next steps: We will have to work to create an ID variable to distinguish unique vendor names, as well as branch locations.  We will also have to speak with the DBA team to let them know that data collected through the app does not work well to aggregate data per delivery id.
+
+```{r}
+#identify outliers and oddities in data
+which(pm$pick_up_wait_mins > pm$total_time_mins) #!!!wait time greater than total time, not possible
+which(pm$order_time_secs > pm$total_time_secs)#nothing wrong here
+which(pm$order_time_mins == pm$pick_up_wait_mins)#nothing wrong here
+
+#remove deliveries where vehicle type is bike and mph > 40, or when vehicle type is walking and mph is greater than 20
+pm <- pm %>%
+  filter(
+    (vehicle_type == 'bicycle' & mph < 40 | is.na(mph))|
+    vehicle_type %in% c("car", "motorcycle", "scooter", "van", "truck" ) |
+    (vehicle_type == 'walker' & mph < 20 | is.na(mph)) 
+  )
+
+#remove occurrance where total delivery time exceeds 4 hours. 
+pm <- pm[-(which(pm$total_time_hours > 4)),]
+
+#remove values where proabbility of occurrance is zero (pickup time is greater than delivery time)
+pm <- pm[-(which(pm$pick_up_wait_mins > pm$total_time_mins)),]
+
+#data exploration, 896 unique pickup places
+pm %>%
+  group_by(pickup_place) %>%
+  summarise(count = n()) %>%
+  nrow
+
+#remove non alphanumeric characters
+pm$pickup_place <- str_replace_all(pm$pickup_place, "[[:punct:]]", "")
+#upper case all pickup places
+pm$pickup_place <- toupper(pm$pickup_place)
+
+#remove archived, closed, and depreciated.
+pm <- pm %>%
+  filter(!grepl('ARCHIVED',pickup_place),
+         !grepl('CLOSED',pickup_place),
+         !grepl('DEPRECATED',pickup_place)
+         )
+#896 unique pickup places now reduced to 879 unique pickup places (about 17)
+pm %>%
+  group_by(pickup_place) %>%
+  summarise(count = n()) %>%
+  nrow
+
+#pm %>%
+ # group_by(place_category) %>%
+  #summarise(count = n())#no anomolies found except for missing data
+
+pm %>%
+  group_by(delivery_id) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  head()#multiple delivery ids per row. Needs to concatinate Item name, and item category name, max(all other variables), sum(item quantity)
+
+#create new variables to merge item names and item categories by delivery id
+pm <- pm %>%
+  group_by(delivery_id) %>%
+  
+  mutate(
+  Item_names = paste0(item_name, collapse = ","),
+  Item_categories = paste0(item_category_name, collapse = ","),
+  total_quantity = sum(item_quantity)
+  )
+
+#select distinct values. Moving forward we will only work with Item_names, Item_categories, and total_quantity only. Ignore original values
+pm <- as.data.frame(pm[!duplicated(pm$delivery_id), ])
+```
+
+
+Now lets look at the data to answer some high level questions about the performance of the New York market. 
+
+Average/Median MPH
+
+An interesting thing to note is that for cars, trucks and vans, we see an increased average wait time compared to walkers, bicycles, scooters, motorcycles. This is probably due to the fact that parking is required often times for pickup. Jumpman might benefit through designated parking spots, or promoting bicycles/walking more. If we look at the max distance traveled, we see that a walker had traveled 5.8 miles to deliver food. Moving forward, consider limiting the amount you can walk because this is not efficient use of time. According to Wikipedia, the average walking MPH is 3. This would have taken 2 hours.
+```{r}
+#average and Median MPH by transportation type
+#this data should be looked at after normalizing above data
+
+
+pm %>%
+  group_by(vehicle_type) %>%
+ summarise(
+   average_wait_time = mean(delivery_time_mins, na.rm = 'T'),
+   max_distance_traveled = max(miles_traveled)
+ )
+```
+
+Most popular delivery types
+  
+We see that the most popular form of delivery type is via bike. This makes the most sense, as the crowded streets of NY might best be navigated through bicycle. Walking and car are also other popular forms of transportation. Jumpman23 might want to further consider promoting bicycles as a good form of transportation as it is the most efficient and green method for deliveries < 1.5 miles, while having the least expensive operating costs for employees.
+
+```{r}
+pm %>%
+  group_by(vehicle_type) %>%
+  summarise(
+    count = n()
+  ) %>%
+  arrange(desc(count)) %>% 
+     ggplot(aes(x = reorder(vehicle_type, -count), y = count)) +
+      geom_bar(stat="identity", fill = "#36454f") +
+      labs(x="Vehicle Tyle", y="Count") 
+```
+
+The most popular places in New York are Shake Shack, Momofuku Milk Bar, The Meatball Shop, and Sweetgreen. Jumpman23 can consider featuring most popular restaurants in the front page of app to test if this drives conversion rate, or reduces average time spent on app before ordering, or a tab with most popular restaurants. Jumpman23 can also consider featuring less popular restaurants to boost sales through partnership deals.
+```{r}
+pm %>%
+  group_by(pickup_place) %>%
+  summarise(
+    count = n()
+  ) %>%
+  arrange(desc(count)) %>% 
+  top_n(20) %>%
+     ggplot(aes(x = reorder(pickup_place, -count), y = count)) +
+      geom_bar(stat="identity", fill = "#36454f") +
+      labs(x="Top 20 Pick Up Locations", y="Count") +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Most popular place categories are Italian, Burger, and American. Also consider a navigation option filtered by most popular place categories on app. Conduct test to determine if effective.
+```{r}
+pm %>%
+  group_by(place_category) %>%
+  summarise(
+    count = n()
+  ) %>%
+  arrange(desc(count)) %>% 
+  filter(!is.na(place_category)) %>%
+  top_n(20) %>%
+     ggplot(aes(x = reorder(place_category, -count), y = count)) +
+      geom_bar(stat="identity", fill = "#36454f") +
+      labs(x="Top 20 Place Categories", y="Count") +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Are top employees also the fastest? 
+
+Without conducting statistical t-tests, it looks at first glance that the top jumpmen tend to deliver on average at a faster rate than the average and bottom jumpman in terms of total deliveries made. Consider creating programs to reward delivery time, or to help average jumpmen to be top jumpmen. Improving Jumpman23 to jumpmen client relationship might increase overall efficiency. 
+```{r}
+mean(pm$delivery_time_mins, na.rm = 'T')
+
+#top jumpmen and average delivery times
+pm %>%
+  group_by(jumpman_id) %>%
+  summarise(
+    count = n(),
+    mean(delivery_time_mins, na.rm = 'T')
+  ) %>%
+  arrange(desc(count)) %>% head()
+
+#bottom jumpmen and average delivery times
+pm %>%
+  group_by(jumpman_id) %>%
+  summarise(
+    count = n(),
+    mean(delivery_time_mins, na.rm = 'T')
+  ) %>%
+  arrange(desc(count)) %>% tail()
+```
+
+
+Mapping 
+
+First, we map the most popular pickup locations. It seems that there are groups clustered around the city that have the hottest pickup locations. 
+
+Consider having a feature in Jumpman app that notifies Jumpmen of local hotspots (based on time of day) to optimize distance traveled between Jumpman starting location and pickup place. 
+
+```{r}
+xquiet<- scale_x_continuous("", breaks=NULL)
+yquiet<-scale_y_continuous("", breaks=NULL)
+quiet<-list(xquiet, yquiet)
+
+#make a filler variable
+pm <-  pm %>%
+   mutate(filler = 1)
+#create dataframes from pm grouped by transport type
+pmbike <- pm %>% filter(vehicle_type == 'bicycle')
+pmcar <- pm %>% filter(vehicle_type == 'car')
+pmMoto <- pm %>% filter(vehicle_type == 'motorcycle')
+pmscooter <- pm %>% filter(vehicle_type == 'scooter')
+pmtruck <- pm %>% filter(vehicle_type == 'truck')
+pmvan <- pm %>% filter(vehicle_type == 'van')
+pmwalker <- pm %>% filter(vehicle_type == 'walker')
+
+#popular pickup locations
+ggplot(pm, aes(pm$pickup_lon, pm$pickup_lat))+
+    geom_point(aes(x=pm$pickup_lon, y=pm$pickup_lat, alpha=filler), col='white', size = .2)+
+    scale_alpha_continuous(range = c(0.01, 0.9), guide = FALSE)+
+  theme(panel.background = element_rect(fill='black',colour='black'))+
+  quiet+
+  coord_equal()+
+  scale_color_brewer(palette="Pastel1") 
+```
+
+Lets take a look now at routes traveled for the sample data we were provided. Please note that a fully rendered version of the map is attached. In R-Markdown, the rendering does not come out with enough detail. Routes are color coded by vehicle type. 
+
+Note that this graphs looks at the path in a straight line. We are not able to map out actual routes taken. 
+```{r}
+#popular trips by vehicle types
+ggplot(pm, aes(pm$pickup_lon, pm$pickup_lat))+
+      geom_point(aes(x=pm$pickup_lon, y=pm$pickup_lat, alpha=filler), col='white', size = .1)+
+     geom_segment(aes(x=pm$pickup_lon, y=pm$pickup_lat,xend=pm$dropoff_lon, yend=pm$dropoff_lat, alpha=filler, col=as.factor(pm$vehicle_type)))+
+    scale_alpha_continuous(range = c(0.5, 0.01),guide = FALSE)+
+  theme(panel.background = element_rect(fill='black',colour='black'))+
+  quiet+
+  coord_equal()+
+  scale_color_brewer(palette="Pastel1")
+
+
+#popular pickup locations (for presentation)
+#ggplot(pm, aes(pm$pickup_lon, pm$pickup_lat))+
+ #   geom_point(aes(x=pm$pickup_lon, y=pm$pickup_lat, alpha=filler), col='white', size = 3)+
+  # geom_segment(aes(x=pm$pickup_lon, y=pm$pickup_lat,xend=pm$dropoff_lon, yend=pm$dropoff_lat, alpha=filler, col=as.factor(pm$vehicle_type)))+
+   # scale_alpha_continuous(range = c(0.01, 0.9))+
+ # theme(panel.background = element_rect(fill='black',colour='black'))+
+  #quiet+
+  #coord_equal()+
+  #scale_color_brewer(palette="Pastel1")
+```
+
+Are we sending cars across central park?
+Looking at the initial graph, we see something that immediately stood out to me. Cars are delivering from one side of central park to the other side of central park. Because cars are not allowed to drive through, this may potentially take longer than biking or walking across central park. Here we look at deliveries by car only, and we can see that there are deliveries across central park. Jumpman23 can potentially optimize time if they sent bikers instead.
+
+```{r}
+
+#car
+ggplot(pmcar, aes(pmcar$pickup_lon, pmcar$pickup_lat))+
+    geom_segment(aes(x=pmcar$pickup_lon, y=pmcar$pickup_lat,xend=pmcar$dropoff_lon, yend=pmcar$dropoff_lat, alpha=filler), col = 'white')+
+    scale_alpha_continuous(range = c(0.5, 0.01),guide = FALSE)+
+  theme(panel.background = element_rect(fill='black',colour='black'))+
+  quiet+
+  coord_equal()
+```
+
+
+Are we sending walkers on long metropolitan hikes?
+We see some occurrences of walkers traversing long distances to deliver food. Walking is probably the slowest form of transportation, and Jumpman23 should limit the distance traveled in the future to optimize efficiency. Walking zones should be metropolitan only. Looks like they do a good job of controlling for this based on the sample.
+
+```{r}
+#walker
+ggplot(pmwalker, aes(pmwalker$pickup_lon, pmwalker$pickup_lat))+
+    geom_segment(aes(x=pmwalker$pickup_lon, y=pmwalker$pickup_lat,xend=pmwalker$dropoff_lon, yend=pmwalker$dropoff_lat, alpha=filler), col = 'white')+
+    scale_alpha_continuous(range = c(0.5, 0.1),guide = FALSE)+
+  theme(panel.background = element_rect(fill='black',colour='black'))+
+  quiet+
+  coord_equal()
+```
+
+Heat Maps and Time of Day Analysis
+
+The most popular time of day for orders is during lunch and dinner. We see more popularity during dinner than lunch. Advise to factor in a price by demand strategy, or to encourage more Jumpmen to be active during this time. 
+```{r}
+#popularity by day of week
+#popularity by time of day
+
+stripped <- strptime(pm$when_the_delivery_started, format = "%Y-%m-%d %H:%M:%S")
+hours <- hour(stripped)
+hours <- as.data.frame(hours)
+names(hours) <- "Hour"
+
+ggplot(hours, aes(hours)) + 
+  geom_density(fill = "#36454f") +
+  labs(x="Hour of Day", y="Count") +
+  ggtitle("Most Popular Time of Day")
+```
+
+
+What day of the week is most popular?
+We see the most popularity on Saturday, Thursday, and Wednesday nights.
+```{r}
+#which day of week?/Hour
+dayOfWeek <- weekdays(stripped)
+df1 <- cbind(hours, dayOfWeek)
+df1 <- as.data.frame(df1)
+names(df1) <- c("Hour", "Day_Of_Week")
+
+
+heatmap <- df1 %>%
+  group_by(
+    Hour,
+     Day_Of_Week
+      ) %>%
+  summarise(
+    count = n()
+  )
+
+ggplot(heatmap, aes(x = Hour, y=Day_Of_Week, fill = count)) + 
+geom_tile( aes(fill = count),color = "white", size = 0.1) +
+coord_equal() + 
+labs( y = NULL, title = "Deliveries per Weekday & Time of Day") +
+theme( axis.ticks = element_blank(),
+       plot.title = element_text(hjust = 0.5),
+       legend.title = element_text(size = 8),
+       legend.text = element_text(size = 6) ) +
+  scale_y_discrete(labels=c("Sun","Mon","Tues","Wed","Thurs","Fri","Sat")) +
+  scale_fill_gradient(low = "khaki2", high = "black")
+```
+
+
+
+
+
+
+
+
